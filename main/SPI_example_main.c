@@ -5,6 +5,7 @@
 #define PIN_NUM_IRQ  4   // Labeled "4" on HUZZAH32 -> Connects to "D2" on Shield
 
 #include <stdio.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h" // FreeRTOS synchronization toolkit
@@ -35,24 +36,58 @@ static void IRAM_ATTR uwb_gpio_isr_handler(void* arg) {
 // =================================================================
 void uwb_event_processor_task(void *pvParameters) {
     printf("UWB Asynchronous Worker Task successfully initialized.\n");
-    uint8_t tx_buffer[5] = { 0x00 }; 
-    uint8_t rx_buffer[5] = { 0 };
+    esp_err_t ret;
 
+    // =================================================================
+    // VERIFICATION: Read the System Status Register (0x00:44)
+    // =================================================================
+    printf("Polling DWM3000 System Status Register...\n");
+
+    // 6 bytes total: 2 for the Extended Header, and 4 for the 32-bit status data
+    uint8_t status_tx[6] = { 0x41, 0x10, 0x00, 0x00, 0x00, 0x00 };
+    uint8_t status_rx[6] = { 0 };
+
+    spi_transaction_t status_desc = {
+        .length = 6 * 8, // 48 bits total
+        .tx_buffer = status_tx,
+        .rx_buffer = status_rx
+    };
+
+    ret = spi_device_transmit(spi_handle, &status_desc);
+    
+    if (ret == ESP_OK) {
+        // rx[0] and rx[1] are garbage (absorbed while sending the headers)
+        // rx[2] through rx[5] contain the actual 32-bit SYS_STATUS payload
+        printf("System Status Register Bytes: 0x%02X 0x%02X 0x%02X 0x%02X\n", 
+               status_rx[2], status_rx[3], status_rx[4], status_rx[5]);
+        
+        // Reconstruct the 32-bit integer (Little-Endian formatting)
+        uint32_t sys_status_val = (status_rx[5] << 24) | (status_rx[4] << 16) | (status_rx[3] << 8) | status_rx[2];
+        printf("Complete SYS_STATUS Value: 0x%08lX\n", sys_status_val);
+    }
+
+    // =================================================================
+    // STEADY STATE: Event Loop
+    // =================================================================
     while (1) {
-        // Sleep indefinitely until the ISR unlatches the semaphore
+        // Only ONE semaphore take is needed!
         if (xSemaphoreTake(uwb_semaphore, portMAX_DELAY) == pdTRUE) {
             printf("\n⚡ [IRQ EVENT]: DWM3000 signal line toggled! Reading hardware...\n");
 
-            spi_transaction_t tx_desc = {
-                .length = 5 * 8,
-                .tx_buffer = tx_buffer,
-                .rx_buffer = rx_buffer
+            // Explicitly define a clean 5-byte payload to read the Device ID (Register 0x00)
+            uint8_t dev_id_tx[5] = { 0x00, 0x00, 0x00, 0x00, 0x00 };
+            uint8_t dev_id_rx[5] = { 0 };
+
+            spi_transaction_t id_desc = {
+                .length = 5 * 8, // 40 bits
+                .tx_buffer = dev_id_tx,
+                .rx_buffer = dev_id_rx
             };
 
-            esp_err_t ret = spi_device_transmit(spi_handle, &tx_desc);
+            ret = spi_device_transmit(spi_handle, &id_desc);
             if (ret == ESP_OK) {
-                uint32_t device_id = (rx_buffer[1] << 24) | (rx_buffer[2] << 16) | (rx_buffer[3] << 8) | rx_buffer[4];
-                printf("Successfully polled device inside RTOS Task. Device ID: 0x%08X\n", device_id);
+                uint32_t device_id = (dev_id_rx[1] << 24) | (dev_id_rx[2] << 16) | (dev_id_rx[3] << 8) | dev_id_rx[4];
+                printf("Successfully polled device inside RTOS Task. Device ID: 0x%08lX\n", device_id);
             }
         }
     }
