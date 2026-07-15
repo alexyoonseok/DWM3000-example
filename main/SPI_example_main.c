@@ -65,6 +65,37 @@ void uwb_event_processor_task(void *pvParameters) {
         uint32_t sys_status_val = (status_rx[5] << 24) | (status_rx[4] << 16) | (status_rx[3] << 8) | status_rx[2];
         printf("Complete SYS_STATUS Value: 0x%08lX\n", sys_status_val);
     }
+/*
+    // =================================================================
+    // CLEANUP: Clear the Startup SPI CRC Error Flag (Write-1-to-Clear)
+    // =================================================================
+    printf("Clearing startup SPI CRC error flag...\n");
+
+    // Byte 0: Write (1), Extended (1), Base 0x00, Sub-bit[6] (1) -> 0xC1
+    // Byte 1: Sub-bits[5:0] for Offset 0x44, Mode Bits (00)     -> 0x10
+    // Byte 2: Data payload writing a 1 strictly to Bit 2       -> 0x04
+    uint8_t clear_tx[3] = { 0xC1, 0x10, 0x04 };
+    uint8_t clear_rx[3] = { 0 };
+
+    spi_transaction_t clear_desc = {
+        .length = 3 * 8, // 24 bits
+        .tx_buffer = clear_tx,
+        .rx_buffer = clear_rx
+    };
+
+    ret = spi_device_transmit(spi_handle, &clear_desc);
+    if (ret == ESP_OK) {
+        printf("Clear command pushed. Re-polling status register...\n");
+    }
+
+    // Perform a quick follow-up read to verify the flag dropped
+    ret = spi_device_transmit(spi_handle, &status_desc);
+    if (ret == ESP_OK) {
+        uint32_t clean_status = (status_rx[5] << 24) | (status_rx[4] << 16) | (status_rx[3] << 8) | status_rx[2];
+        printf("New Baseline SYS_STATUS Value: 0x%08lX\n", clean_status);
+    }
+*/
+
 
     // =================================================================
     // STEADY STATE: Event Loop
