@@ -65,7 +65,11 @@ void uwb_event_processor_task(void *pvParameters) {
         uint32_t sys_status_val = (status_rx[5] << 24) | (status_rx[4] << 16) | (status_rx[3] << 8) | status_rx[2];
         printf("Complete SYS_STATUS Value: 0x%08lX\n", sys_status_val);
     }
-/*
+
+
+
+
+/* Uncomment CRCE cleanup if needed in the future.
     // =================================================================
     // CLEANUP: Clear the Startup SPI CRC Error Flag (Write-1-to-Clear)
     // =================================================================
@@ -96,12 +100,110 @@ void uwb_event_processor_task(void *pvParameters) {
     }
 */
 
+    // =================================================================
+    // 1. RF CONFIGURATION: Establish Channel 5 @ 64 MHz PRF
+    // =================================================================
+    printf("Writing Channel Control Profiles (REG:01:14)...\n");
+
+    // 2 Header Bytes + 2 Data Bytes (0x094E50C2 in Little-Endian)
+    uint8_t chan_config_tx[4] = { 0xC2, 0x50, 0x4E, 0x09 };
+    uint8_t chan_config_rx[4] = { 0 };
+
+    spi_transaction_t chan_desc = {
+        .length = 4 * 8, // 48 bits
+        .tx_buffer = chan_config_tx,
+        .rx_buffer = chan_config_rx
+    };
+
+    ret = spi_device_transmit(spi_handle, &chan_desc);
+    if (ret == ESP_OK) {
+        printf(" -> Channel 5 profile and Preamble Code 9 committed successfully.\n");
+    }
+    else {
+        printf(" * Failed to configure CHAN_CTRL register");
+    }
+
+    // =================================================================
+    // 2. FRAME CONFIGURATION: Set 512 Preamble Length & 6.8 Mbps Data Rate
+    // =================================================================
+    printf("Writing Transmit Frame Control Parameters (REG:08:00)...\n");
+
+    // 2 Header Bytes + 6 Data Bytes (0x3F0000000C0C50C0 in Little-Endian)
+    uint8_t frame_config_tx[8] = { 0xC0, 0x50, 0x0C, 0x0C, 0x00, 0x00, 0x00, 0x3F };
+    uint8_t frame_config_rx[8] = { 0 };
+
+    spi_transaction_t frame_desc = {
+        .length = 8 * 8, // 48 bits
+        .tx_buffer = frame_config_tx,
+        .rx_buffer = frame_config_rx
+    };
+
+    ret = spi_device_transmit(spi_handle, &frame_desc);
+    if (ret == ESP_OK) {
+        printf(" -> Preamble length targeted to 512 symbols at 6.8 Mbps.\n");
+    }
+    else {
+        printf(" * Failed to configure TX_FCTRL register");
+    }
+
+    // =================================================================
+    // 3. ANTENNA DELAY CONFIGURATION: Set Default Calibration Values
+    // =================================================================
+    printf("Setting Antenna Delays (REG:01:04 & REG:0E:00)...\n");
+
+    // 1. TX Antenna Delay (REG:01:04) -> 2 Header Bytes + 2 Data Bytes (0x4015)
+    // Header: 0xC2 (Base 0x01, WR), 0x10 (Sub 0x04)
+    uint8_t tx_antd_tx[4] = { 0xC2, 0x10, 0x15, 0x40 };
+    spi_transaction_t tx_antd_desc = { 
+        .length = 4 * 8, 
+        .tx_buffer = tx_antd_tx, 
+        .rx_buffer = NULL 
+    };
+    spi_device_transmit(spi_handle, &tx_antd_desc);
+
+    // 2. RX Antenna Delay inside CIA_CONF (REG:0E:00) -> 2 Header Bytes + 4 Data Bytes
+    // Header: 0xDC (Base 0x0E, WR), 0x00 (Sub 0x00)
+    // Payload: Lower 16 bits = 0x4015 (RX_ANTD), Bit 20 = 1 (MINDIAG) -> 0x00104015
+    uint8_t cia_conf_tx[6] = { 0xDC, 0x00, 0x15, 0x40, 0x10, 0x00 };
+    spi_transaction_t cia_conf_desc = { 
+        .length = 6 * 8, 
+        .tx_buffer = cia_conf_tx, 
+        .rx_buffer = NULL 
+    };
+    spi_device_transmit(spi_handle, &cia_conf_desc);
+
+    printf(" -> Antenna delays set to 0x4015 with MINDIAG enabled.\n");
+
+    // =================================================================
+    // 4. INTERRUPT MASK: 16-Bit Hardware Masked Write on SYS_ENABLE_0 
+    // =================================================================
+    printf("Unmasking TXFRS and RXFCG via Hardware Masked Write (REG:00:3C)...\n");
+
+    // Header: 0xC0 (Write, Base 0), 0xF2 (Sub 0x3C, Mode 10 for 16-bit mask)
+    // AND Mask: 0xFF, 0xFF (Preserve all existing bit states)
+    // OR Mask:  0x80, 0x40 (Force Bit 7 and Bit 14 to 1)
+    
+    uint8_t enable_mask_tx[6] = { 0xC0, 0xF2, 0xFF, 0xFF, 0x80, 0x40 };
+    
+    spi_transaction_t mask_enable_desc = {
+        .length = 6 * 8, // 48 bits total
+        .tx_buffer = enable_mask_tx,
+        .rx_buffer = NULL
+    };
+
+    ret = spi_device_transmit(spi_handle, &mask_enable_desc);
+    if (ret == ESP_OK) {
+        printf(" -> SYS_ENABLE_0 updated via 16-bit hardware mask!\n");
+    }
+
+    // Short stability delay to allow configuration latches to lock
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+
 
     // =================================================================
     // STEADY STATE: Event Loop
     // =================================================================
     while (1) {
-        // Only ONE semaphore take is needed!
         if (xSemaphoreTake(uwb_semaphore, portMAX_DELAY) == pdTRUE) {
             printf("\n⚡ [IRQ EVENT]: DWM3000 signal line toggled! Reading hardware...\n");
 
