@@ -93,3 +93,33 @@ if __name__ == "__main__":
     # 5. TXSTRT Fast Command (Cmd ID 0x01)
     h5 = generate_dw3000_header("fast", cmd_id=0x01)
     print(f"5. FAST CMD TXSTRT (0x01):       {h5}")
+
+    # 6. TXFRS and RXFCG (Base 0x00, Sub 0x3C) - WRITE
+    h6 = generate_dw3000_header(
+        "mask", base_addr=0x00, sub_addr=0x3C, is_write=True
+    )
+    print(f"6. MASK TXFRS and RXFCG (0x00:3C):       {h6}")
+
+    # 7. CHAN_CTRL (Base 0x01, Sub 0x14) - WRITE
+    h7 = generate_dw3000_header(
+        "full", base_addr=0x01, sub_addr=0x14, is_write=True
+    )
+    print(f"7. WRITE CHAN_CTRL (0x00:14):      {h7}")
+
+    # 8. TX_FCTRL (Base 0x00, Sub 0x24) - WRITE
+    h8 = generate_dw3000_header(
+        "full", base_addr=0x00, sub_addr=0x24, is_write=True
+    )
+    print(f"8. WRITE TX_FCTRL (0x00:24):      {h8}")
+
+    # 9. SYS_STATUS (Base 0x00, Sub 0x44) - READ
+    h9 = generate_dw3000_header(
+        "full", base_addr=0x00, sub_addr=0x44, is_write=False
+    )
+    print(f"9. READ SYS_STATUS (0x00:44):      {h9}")
+
+    # 10. SYS_STATUS (Base 0x00, Sub 0x44) - WRITE
+    h10 = generate_dw3000_header(
+        "full", base_addr=0x00, sub_addr=0x44, is_write=True
+    )
+    print(f"10. WRITE SYS_STATUS (0x00:44):      {h10}")

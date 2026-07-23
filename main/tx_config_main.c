@@ -16,6 +16,35 @@
 spi_device_handle_t spi_handle;
 SemaphoreHandle_t uwb_semaphore = NULL;
 
+// Forward declaration
+void send_poll_frame(void);
+
+// =================================================================
+// REGISTER READBACK VERIFIER
+// =================================================================
+void debug_read_register(const char* reg_name, uint8_t base_addr, uint8_t sub_addr, uint8_t data_len) {
+    uint8_t tx_buf[10] = { 0 };
+    uint8_t rx_buf[10] = { 0 };
+
+    tx_buf[0] = 0x40 | ((base_addr & 0x1F) << 1) | ((sub_addr >> 6) & 0x01);
+    tx_buf[1] = (sub_addr & 0x3F) << 2;
+
+    spi_transaction_t desc = {
+        .length = (2 + data_len) * 8,
+        .tx_buffer = tx_buf,
+        .rx_buffer = rx_buf
+    };
+
+    if (spi_device_transmit(spi_handle, &desc) == ESP_OK) {
+        printf(" [VERIFY %s (REG:%02X:%02X)]: ", reg_name, base_addr, sub_addr);
+        for (int i = 2; i < 2 + data_len; i++) {
+            printf("0x%02X ", rx_buf[i]);
+        }
+        printf("\n");
+    }
+}
+
+
 // =================================================================
 // 1. THE HARDWARE INTERRUPT SERVICE ROUTINE (ISR)
 // =================================================================
@@ -38,6 +67,7 @@ void uwb_event_processor_task(void *pvParameters) {
     printf("UWB Asynchronous Worker Task successfully initialized.\n");
     esp_err_t ret;
 
+/* Uncomment SYS_STATUS reading if needed in the future
     // =================================================================
     // VERIFICATION: Read the System Status Register (0x00:44)
     // =================================================================
@@ -65,7 +95,7 @@ void uwb_event_processor_task(void *pvParameters) {
         uint32_t sys_status_val = (status_rx[5] << 24) | (status_rx[4] << 16) | (status_rx[3] << 8) | status_rx[2];
         printf("Complete SYS_STATUS Value: 0x%08lX\n", sys_status_val);
     }
-
+*/
 
 
 
@@ -105,6 +135,7 @@ void uwb_event_processor_task(void *pvParameters) {
     // =================================================================
     printf("Writing Channel Control Profiles (REG:01:14)...\n");
 
+    // Base 0x01, Sub 0x14
     // 2 Header Bytes + 2 Data Bytes (0x094E50C2 in Little-Endian)
     uint8_t chan_config_tx[4] = { 0xC2, 0x50, 0x4E, 0x09 };
     uint8_t chan_config_rx[4] = { 0 };
@@ -118,6 +149,7 @@ void uwb_event_processor_task(void *pvParameters) {
     ret = spi_device_transmit(spi_handle, &chan_desc);
     if (ret == ESP_OK) {
         printf(" -> Channel 5 profile and Preamble Code 9 committed successfully.\n");
+        debug_read_register("CHAN_CTRL", 0x01, 0x14, 2);
     }
     else {
         printf(" * Failed to configure CHAN_CTRL register");
@@ -126,10 +158,10 @@ void uwb_event_processor_task(void *pvParameters) {
     // =================================================================
     // 2. FRAME CONFIGURATION: Set 512 Preamble Length & 6.8 Mbps Data Rate
     // =================================================================
-    printf("Writing Transmit Frame Control Parameters (REG:08:00)...\n");
+    printf("Writing Transmit Frame Control Parameters (REG:00:24)...\n");
 
-    // 2 Header Bytes + 6 Data Bytes (0x3F0000000C0C50C0 in Little-Endian)
-    uint8_t frame_config_tx[8] = { 0xC0, 0x50, 0x0C, 0x0C, 0x00, 0x00, 0x00, 0x3F };
+    // 2 Header Bytes + 6 Data Bytes (0x3F0000000C0C90C0 in Little-Endian)
+    uint8_t frame_config_tx[8] = { 0xC0, 0x90, 0x0C, 0x0C, 0x00, 0x00, 0x00, 0x3F };
     uint8_t frame_config_rx[8] = { 0 };
 
     spi_transaction_t frame_desc = {
@@ -141,6 +173,7 @@ void uwb_event_processor_task(void *pvParameters) {
     ret = spi_device_transmit(spi_handle, &frame_desc);
     if (ret == ESP_OK) {
         printf(" -> Preamble length targeted to 512 symbols at 6.8 Mbps.\n");
+        debug_read_register("TX_FCTRL", 0x00, 0x24, 6);
     }
     else {
         printf(" * Failed to configure TX_FCTRL register");
@@ -160,6 +193,7 @@ void uwb_event_processor_task(void *pvParameters) {
         .rx_buffer = NULL 
     };
     spi_device_transmit(spi_handle, &tx_antd_desc);
+    debug_read_register("TX_ANTD", 0x01, 0x04, 2);
 
     // 2. RX Antenna Delay inside CIA_CONF (REG:0E:00) -> 2 Header Bytes + 4 Data Bytes
     // Header: 0xDC (Base 0x0E, WR), 0x00 (Sub 0x00)
@@ -171,6 +205,7 @@ void uwb_event_processor_task(void *pvParameters) {
         .rx_buffer = NULL 
     };
     spi_device_transmit(spi_handle, &cia_conf_desc);
+    debug_read_register("CIA_CONF", 0x0E, 0x00, 4);
 
     printf(" -> Antenna delays set to 0x4015 with MINDIAG enabled.\n");
 
@@ -194,36 +229,139 @@ void uwb_event_processor_task(void *pvParameters) {
     ret = spi_device_transmit(spi_handle, &mask_enable_desc);
     if (ret == ESP_OK) {
         printf(" -> SYS_ENABLE_0 updated via 16-bit hardware mask!\n");
+        debug_read_register("SYS_ENABLE_0", 0x00, 0x3C, 6);
+    }
+    else {
+        printf(" * Failed to unmask interrupt masks");
     }
 
     // Short stability delay to allow configuration latches to lock
     vTaskDelay(10 / portTICK_PERIOD_MS);
 
 
+    debug_read_register("SYS_STATUS", 0x00, 0x44, 6);
+
+    // Trigger first transmission
+    //send_poll_frame();
+
     // =================================================================
     // STEADY STATE: Event Loop
     // =================================================================
     while (1) {
-        if (xSemaphoreTake(uwb_semaphore, portMAX_DELAY) == pdTRUE) {
-            printf("\n⚡ [IRQ EVENT]: DWM3000 signal line toggled! Reading hardware...\n");
+        if (xSemaphoreTake(uwb_semaphore, pdMS_TO_TICKS(3000)) == pdTRUE) {
+            
+            // -------------------------------------------------------------
+            // STEP 1: READ SYS_STATUS (0x00:44) - 2 Header + 6 Data Bytes = 8 Bytes
+            // -------------------------------------------------------------
+            uint8_t status_tx[8] = { 0x41, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+            uint8_t status_rx[8] = { 0 };
+            
+            spi_transaction_t status_desc = {
+                .length = 8 * 8, // 64 bits total
+                .tx_buffer = status_tx,
+                .rx_buffer = status_rx
+            };
+            spi_device_transmit(spi_handle, &status_desc);
 
-            // Explicitly define a clean 5-byte payload to read the Device ID (Register 0x00)
-            uint8_t dev_id_tx[5] = { 0x00, 0x00, 0x00, 0x00, 0x00 };
-            uint8_t dev_id_rx[5] = { 0 };
+            printf("\n⚡ [IRQ EVENT] Raw SYS_STATUS Bytes: ");
+            for (int i = 2; i < 8; i++) {
+                printf("0x%02X ", status_rx[i]);
+            }
+            printf("\n");
 
-            spi_transaction_t id_desc = {
-                .length = 5 * 8, // 40 bits
-                .tx_buffer = dev_id_tx,
-                .rx_buffer = dev_id_rx
+            // Reconstruct 32-bit status value
+            uint32_t sys_status_low = (status_rx[5] << 24) | (status_rx[4] << 16) | (status_rx[3] << 8) | status_rx[2];
+
+            if (sys_status_low & (1UL << 7)) {
+                printf(" SUCCESS: [TX COMPLETE] POLL frame sent!\n");
+            }
+
+            // -------------------------------------------------------------
+            // STEP 2: FORCIBLY CLEAR ALL ACTIVE INTERRUPTS (Write-1-to-Clear)
+            // -------------------------------------------------------------
+            // Header for WRITE to SYS_STATUS (0x00:44) -> { 0xC1, 0x10 }
+            // Write back the exact received payload bytes! (Since 1s clear the flags)
+            uint8_t clear_tx[8] = {
+                0xC1, 0x10,
+                status_rx[2], status_rx[3], status_rx[4],
+                status_rx[5], status_rx[6], status_rx[7]
             };
 
-            ret = spi_device_transmit(spi_handle, &id_desc);
-            if (ret == ESP_OK) {
-                uint32_t device_id = (dev_id_rx[1] << 24) | (dev_id_rx[2] << 16) | (dev_id_rx[3] << 8) | dev_id_rx[4];
-                printf("Successfully polled device inside RTOS Task. Device ID: 0x%08lX\n", device_id);
-            }
+            spi_transaction_t clear_desc = {
+                .length = 8 * 8,
+                .tx_buffer = clear_tx,
+                .rx_buffer = NULL
+            };
+            spi_device_transmit(spi_handle, &clear_desc);
+
+            // Give DWM3000 time to drop IRQ line
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+
+        } else {
+            // Timeout reached: send another poll packet
+            printf("\n [TIMER]: Re-transmitting POLL frame...\n");
+            send_poll_frame();
         }
     }
+}
+
+
+// =================================================================
+// TAG TRANSMITTER: Send SS-TWR Poll Frame (DW3000 Native)
+// =================================================================
+
+// 12-byte payload: "POLL_FRAME_0"
+static uint8_t poll_payload[12] = { 'P', 'O', 'L', 'L', '_', 'F', 'R', 'A', 'M', 'E', '_', '0' };
+
+void send_poll_frame(void) {
+    printf("\n[TAG]: Preparing to transmit POLL frame...\n");
+
+    // -------------------------------------------------------------
+    // 1. Write Payload to TX_BUFFER (Base Address 0x14, Sub-Offset 0x00)
+    // -------------------------------------------------------------
+    // Header for Full Addressed Write to 0x14:00 -> { 0xE8, 0x00 }
+    // (Base 0x14: WR=1, Full=1, Base=10100, Sub6=0 -> 1110 1000 = 0xE8)
+    uint8_t tx_buf_spi[14];
+    tx_buf_spi[0] = 0xE8; 
+    tx_buf_spi[1] = 0x00;
+    memcpy(&tx_buf_spi[2], poll_payload, 12);
+
+    spi_transaction_t tx_buf_desc = {
+        .length = 14 * 8, // 2 Header Bytes + 12 Payload Bytes
+        .tx_buffer = tx_buf_spi,
+        .rx_buffer = NULL
+    };
+    spi_device_transmit(spi_handle, &tx_buf_desc);
+
+    // -------------------------------------------------------------
+    // 2. Update TXFLEN in TX_FCTRL (Base 0x00, Sub-Offset 0x24)
+    // -------------------------------------------------------------
+    // Total Frame Length = 12 Payload Bytes + 2 CRC FCS Bytes = 14 Bytes (0x000E)
+    // Use 16-bit Hardware Masked Write to update lower 10 bits (TXFLEN)
+    // Header for Masked Write to 0x00:24 -> { 0xC0, 0x92 } (Base 0, Sub 0x24, Mode 10)
+    // AND Mask: 0xFC00 (Preserve upper bits), OR Mask: 0x000E (TXFLEN = 14)
+    uint8_t fctrl_mask_tx[6] = { 0xC0, 0x92, 0x00, 0xFC, 0x0E, 0x00 };
+
+    spi_transaction_t fctrl_desc = {
+        .length = 6 * 8,
+        .tx_buffer = fctrl_mask_tx,
+        .rx_buffer = NULL
+    };
+    spi_device_transmit(spi_handle, &fctrl_desc);
+
+    // -------------------------------------------------------------
+    // 3. Trigger Transmission + Wait-for-Response (CMD_TX_W4R = 0x0C)
+    // -------------------------------------------------------------
+    // Fast Command Header for 0x0C: 1 0 [01100] 1 -> 0x99
+    uint8_t fast_cmd_tx[1] = { 0x99 };
+    spi_transaction_t cmd_desc = {
+        .length = 1 * 8,
+        .tx_buffer = fast_cmd_tx,
+        .rx_buffer = NULL
+    };
+    spi_device_transmit(spi_handle, &cmd_desc);
+
+    printf(" -> CMD_TX_W4R issued! Radio transmitted and auto-enabled receiver.\n");
 }
 
 void app_main(void) {
@@ -257,8 +395,8 @@ void app_main(void) {
         .pin_bit_mask = (1ULL << PIN_NUM_IRQ),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE, // DWM3000 active low lines hold state high
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_NEGEDGE       // Fire interrupt when voltage DROPS (falling edge)
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_POSEDGE       // Fire interrupt when voltage DROPS (falling edge)
     };
     gpio_config(&io_conf);
 
