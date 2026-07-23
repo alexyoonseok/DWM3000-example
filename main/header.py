@@ -123,3 +123,9 @@ if __name__ == "__main__":
         "full", base_addr=0x00, sub_addr=0x44, is_write=True
     )
     print(f"10. WRITE SYS_STATUS (0x00:44):      {h10}")
+
+    # 11. SEQ_CTRL (Base 0x11, Sub 0x08) - WRITE
+    h11 = generate_dw3000_header(
+        "full", base_addr=0x11, sub_addr=0x08, is_write=True
+    )
+    print(f"11. WRITE SEQ_CTRL (0x11:08):      {h11}")

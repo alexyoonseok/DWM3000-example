@@ -131,6 +131,32 @@ void uwb_event_processor_task(void *pvParameters) {
 */
 
     // =================================================================
+    // AUTO IDLE PLL CONFIGURATION: Safe 16-Bit Masked Write on SEQ_CTRL (REG:11:08)
+    // =================================================================
+    printf("Enabling AINIT2IDLE via 16-bit hardware mask (REG:11:08)...\n");
+
+    // Header: 0xE2, 0x22 (Base 0x11, Sub 0x08, Mode 10 for 16-bit mask)
+    // AND Mask: 0xFF, 0xFF (Preserve all existing register states)
+    // OR Mask:  0x00, 0x01 (Force Bit 8 [AINIT2IDLE] to 1)
+    uint8_t seq_mask_tx[6] = { 0xE2, 0x22, 0xFF, 0xFF, 0x00, 0x01 };
+
+    spi_transaction_t seq_desc = {
+        .length = 6 * 8, // 48 bits total
+        .tx_buffer = seq_mask_tx,
+        .rx_buffer = NULL
+    };
+
+    ret = spi_device_transmit(spi_handle, &seq_desc);
+    if (ret == ESP_OK) {
+        printf(" -> SEQ_CTRL updated safely! AINIT2IDLE (Bit 8) enabled without touching reserved bits.\n");
+        debug_read_register("AINIT2IDLE", 0x11, 0x08, 4);
+    }
+    else {
+        printf(" * Failed to enable AINIT2IDLE");
+    }
+
+
+    // =================================================================
     // 1. RF CONFIGURATION: Establish Channel 5 @ 64 MHz PRF
     // =================================================================
     printf("Writing Channel Control Profiles (REG:01:14)...\n");
@@ -235,73 +261,64 @@ void uwb_event_processor_task(void *pvParameters) {
         printf(" * Failed to unmask interrupt masks");
     }
 
-    // Short stability delay to allow configuration latches to lock
+    // =================================================================
+    // STARTUP CLEANUP: Clear power-on flags in SYS_STATUS (W1C)
+    // =================================================================
+    printf("Clearing startup status flags to drive IRQ pin LOW...\n");
+
+    // Write-1-to-Clear (W1C) on SYS_STATUS (0x00:44)
+    // Header: 0xC1, 0x10. Write 0xFF to clear all lower bits (including IRQS and SPIRDY)
+    uint8_t clear_startup_tx[8] = { 0xC1, 0x10, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    
+    spi_transaction_t clear_startup_desc = {
+        .length = 8 * 8,
+        .tx_buffer = clear_startup_tx,
+        .rx_buffer = NULL
+    };
+    spi_device_transmit(spi_handle, &clear_startup_desc);
+
+    // Verify SYS_STATUS dropped to 0x00
+    debug_read_register("SYS_STATUS (Post-Clear)", 0x00, 0x44, 6);
+
     vTaskDelay(10 / portTICK_PERIOD_MS);
-
-
-    debug_read_register("SYS_STATUS", 0x00, 0x44, 6);
-
-    // Trigger first transmission
-    //send_poll_frame();
 
     // =================================================================
     // STEADY STATE: Event Loop
     // =================================================================
     while (1) {
-        if (xSemaphoreTake(uwb_semaphore, pdMS_TO_TICKS(3000)) == pdTRUE) {
-            
-            // -------------------------------------------------------------
-            // STEP 1: READ SYS_STATUS (0x00:44) - 2 Header + 6 Data Bytes = 8 Bytes
-            // -------------------------------------------------------------
+        printf("\n[TIMER]: Sending periodic POLL frame...\n");
+        send_poll_frame();
+
+        // Wait up to 1 second for the hardware IRQ rising edge
+        if (xSemaphoreTake(uwb_semaphore, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            printf("⚡ [HW IRQ RECEIVED]: DW3000 fired rising edge on GPIO 4!\n");
+
+            // Read 8 bytes total: 2 Header Bytes + 6 Data Octets
             uint8_t status_tx[8] = { 0x41, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
             uint8_t status_rx[8] = { 0 };
-            
-            spi_transaction_t status_desc = {
-                .length = 8 * 8, // 64 bits total
-                .tx_buffer = status_tx,
-                .rx_buffer = status_rx
-            };
+            spi_transaction_t status_desc = { .length = 8 * 8, .tx_buffer = status_tx, .rx_buffer = status_rx };
             spi_device_transmit(spi_handle, &status_desc);
 
-            printf("\n⚡ [IRQ EVENT] Raw SYS_STATUS Bytes: ");
-            for (int i = 2; i < 8; i++) {
-                printf("0x%02X ", status_rx[i]);
-            }
-            printf("\n");
+            // Print ALL 6 payload bytes (Octets 0 through 5)
+            printf(" -> Full SYS_STATUS: 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n", 
+                status_rx[2], status_rx[3], status_rx[4], status_rx[5], status_rx[6], status_rx[7]);
 
-            // Reconstruct 32-bit status value
-            uint32_t sys_status_low = (status_rx[5] << 24) | (status_rx[4] << 16) | (status_rx[3] << 8) | status_rx[2];
-
-            if (sys_status_low & (1UL << 7)) {
-                printf(" SUCCESS: [TX COMPLETE] POLL frame sent!\n");
+            // Check if Bit 7 of Byte 0 (TXFRS) or any RX event in Byte 1 / Byte 4 fired
+            if (status_rx[2] & 0x80) {
+                printf(" 🎉 SUCCESS: [TX COMPLETE] POLL frame sent over the air!\n");
             }
 
-            // -------------------------------------------------------------
-            // STEP 2: FORCIBLY CLEAR ALL ACTIVE INTERRUPTS (Write-1-to-Clear)
-            // -------------------------------------------------------------
-            // Header for WRITE to SYS_STATUS (0x00:44) -> { 0xC1, 0x10 }
-            // Write back the exact received payload bytes! (Since 1s clear the flags)
+            // Write-1-to-Clear (W1C) across ALL 6 bytes to clear Octets 4 and 5 as well!
             uint8_t clear_tx[8] = {
                 0xC1, 0x10,
                 status_rx[2], status_rx[3], status_rx[4],
                 status_rx[5], status_rx[6], status_rx[7]
             };
-
-            spi_transaction_t clear_desc = {
-                .length = 8 * 8,
-                .tx_buffer = clear_tx,
-                .rx_buffer = NULL
-            };
+            spi_transaction_t clear_desc = { .length = 8 * 8, .tx_buffer = clear_tx, .rx_buffer = NULL };
             spi_device_transmit(spi_handle, &clear_desc);
-
-            // Give DWM3000 time to drop IRQ line
-            vTaskDelay(10 / portTICK_PERIOD_MS);
-
-        } else {
-            // Timeout reached: send another poll packet
-            printf("\n [TIMER]: Re-transmitting POLL frame...\n");
-            send_poll_frame();
         }
+
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
 }
 
@@ -349,11 +366,14 @@ void send_poll_frame(void) {
     };
     spi_device_transmit(spi_handle, &fctrl_desc);
 
+    // Short 1ms delay for register latches to settle before firing command
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+
     // -------------------------------------------------------------
     // 3. Trigger Transmission + Wait-for-Response (CMD_TX_W4R = 0x0C)
     // -------------------------------------------------------------
     // Fast Command Header for 0x0C: 1 0 [01100] 1 -> 0x99
-    uint8_t fast_cmd_tx[1] = { 0x99 };
+    uint8_t fast_cmd_tx[1] = { 0x83 };
     spi_transaction_t cmd_desc = {
         .length = 1 * 8,
         .tx_buffer = fast_cmd_tx,
@@ -361,7 +381,7 @@ void send_poll_frame(void) {
     };
     spi_device_transmit(spi_handle, &cmd_desc);
 
-    printf(" -> CMD_TX_W4R issued! Radio transmitted and auto-enabled receiver.\n");
+    printf(" -> CMD_TX issued! Radio transmitted and auto-enabled receiver.\n");
 }
 
 void app_main(void) {
@@ -394,7 +414,7 @@ void app_main(void) {
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << PIN_NUM_IRQ),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE, // DWM3000 active low lines hold state high
+        .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_ENABLE,
         .intr_type = GPIO_INTR_POSEDGE       // Fire interrupt when voltage DROPS (falling edge)
     };
